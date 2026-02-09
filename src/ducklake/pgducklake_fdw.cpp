@@ -38,6 +38,9 @@ extern "C" {
 
 #include "pgduckdb/utility/cpp_wrapper.hpp"
 
+#include <string>
+#include <unordered_map>
+
 // Forward declarations to avoid including cpp_only headers
 namespace pgduckdb {
 bool IsExtensionRegistered();
@@ -51,6 +54,8 @@ namespace pgduckdb {
 constexpr const char *FDW_PROBE_ATTACH_NAME = "fdw_probe_ddl";
 constexpr double DEFAULT_FOREIGN_TABLE_ROWS = 1000.0;
 
+static std::unordered_map<std::string, std::string> ducklake_attach_config_by_alias;
+
 struct DucklakeFdwOption {
 	const char *optname;
 	Oid context;
@@ -59,6 +64,7 @@ struct DucklakeFdwOption {
 
 static const struct DucklakeFdwOption valid_server_options[] = {
     {"dbname", ForeignServerRelationId, false},          // Target database name
+    {"uri", ForeignServerRelationId, false},             // DuckLake URI/catalog path (e.g., frozen ducklake URL)
     {"metadata_schema", ForeignServerRelationId, false}, // DuckLake metadata schema (default: ducklake)
     {NULL, InvalidOid, false}                            // Sentinel
 };
@@ -73,6 +79,7 @@ static const struct DucklakeFdwOption valid_table_options[] = {
  * Walk through join conditions, WHERE clauses, and other expressions to find subqueries.
  */
 static void RegisterForeignTablesInQueryExprs(Query *query);
+static const char *GetCurrentDatabaseName(void);
 
 static bool
 IsValidDucklakeFdwOption(const char *optname, Oid context) {
@@ -126,6 +133,25 @@ ValidateRequiredOptions(List *options_list, Oid context) {
 	}
 }
 
+static void
+ValidateServerOptionCombinations(List *options_list) {
+	bool has_dbname = false;
+	bool has_uri = false;
+
+	foreach_node(DefElem, def, options_list) {
+		if (strcmp(def->defname, "dbname") == 0) {
+			has_dbname = true;
+		} else if (strcmp(def->defname, "uri") == 0) {
+			has_uri = true;
+		}
+	}
+
+	if (has_dbname && has_uri) {
+		ereport(ERROR, (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+		                errmsg("options \"dbname\" and \"uri\" are mutually exclusive")));
+	}
+}
+
 static const char *
 GetOptionValue(List *options, const char *optname, const char *default_value = nullptr) {
 	foreach_node(DefElem, def, options) {
@@ -134,6 +160,36 @@ GetOptionValue(List *options, const char *optname, const char *default_value = n
 		}
 	}
 	return default_value;
+}
+
+struct DucklakeFdwServerConfig {
+	const char *dbname;
+	const char *uri;
+	const char *metadata_schema;
+};
+
+static DucklakeFdwServerConfig
+GetDucklakeFdwServerConfig(ForeignServer *server) {
+	DucklakeFdwServerConfig config = {};
+	config.dbname = GetOptionValue(server->options, "dbname");
+	config.uri = GetOptionValue(server->options, "uri");
+	config.metadata_schema = GetOptionValue(server->options, "metadata_schema");
+
+	if (!config.uri && !config.dbname) {
+		config.dbname = GetCurrentDatabaseName();
+	}
+
+	if (!config.uri && !config.metadata_schema) {
+		/* Keep existing behavior for PostgreSQL-backed DuckLake catalogs. */
+		config.metadata_schema = "ducklake";
+	}
+
+	return config;
+}
+
+static char *
+GetDucklakeServerAttachAlias(Oid server_oid) {
+	return psprintf("fdw_srv_%u", server_oid);
 }
 
 /*
@@ -157,20 +213,61 @@ EscapeDuckDBStringLiteral(const char *value) {
 	return duckdb::StringUtil::Replace(std::string(value), "'", "''");
 }
 
-static void
-RegisterDucklakeForeignTable_Cpp(const char *dbname, const char *username, const char *metadata_schema,
-                                 const char *attach_as) {
-	/* Escape string values to prevent SQL injection */
-	auto escaped_dbname = EscapeDuckDBStringLiteral(dbname);
-	auto escaped_username = EscapeDuckDBStringLiteral(username);
-	auto escaped_metadata_schema = EscapeDuckDBStringLiteral(metadata_schema);
+static bool
+HasDucklakeUriScheme(const char *uri) {
+	constexpr const char *ducklake_prefix = "ducklake:";
+	return uri && pg_strncasecmp(uri, ducklake_prefix, strlen(ducklake_prefix)) == 0;
+}
 
-	auto attach_query = duckdb::StringUtil::Format(
-	    "ATTACH IF NOT EXISTS 'postgres:dbname=%s user=%s' AS %s (TYPE DUCKLAKE, METADATA_SCHEMA '%s')",
-	    escaped_dbname.c_str(), escaped_username.c_str(), attach_as, escaped_metadata_schema.c_str());
+static void
+RegisterDucklakeForeignTable_Cpp(const char *dbname, const char *username, const char *uri, const char *metadata_schema,
+                                 const char *attach_as) {
+	const std::string attach_alias = attach_as;
+	std::string attach_path;
+	if (uri) {
+		attach_path = uri;
+	} else {
+		attach_path = duckdb::StringUtil::Format("postgres:dbname=%s user=%s", dbname, username);
+	}
+
+	auto escaped_attach_path = EscapeDuckDBStringLiteral(attach_path.c_str());
+
+	std::string attach_options;
+	if (uri) {
+		/*
+		 * "ducklake:" URIs already encode the DuckLake attach type. Re-specifying TYPE DUCKLAKE
+		 * causes DuckDB to treat the URI as a new metadata path and can trigger DATA_PATH errors.
+		 */
+		if (HasDucklakeUriScheme(uri)) {
+			attach_options = "READ_ONLY";
+		} else {
+			attach_options = "TYPE DUCKLAKE, READ_ONLY";
+		}
+	} else {
+		attach_options = "TYPE DUCKLAKE";
+	}
+
+	if (metadata_schema) {
+		auto escaped_metadata_schema = EscapeDuckDBStringLiteral(metadata_schema);
+		attach_options += duckdb::StringUtil::Format(", METADATA_SCHEMA '%s'", escaped_metadata_schema.c_str());
+	}
+
+	const std::string attach_config = duckdb::StringUtil::Format("%s|%s", attach_path.c_str(), attach_options.c_str());
+	auto config_it = ducklake_attach_config_by_alias.find(attach_alias);
+	if (config_it != ducklake_attach_config_by_alias.end() && config_it->second != attach_config) {
+		auto detach_query = duckdb::StringUtil::Format("DETACH DATABASE IF EXISTS %s", attach_as);
+		elog(DEBUG1, "(DuckLake FDW) Reattaching database as '%s' due to changed server options", attach_as);
+		pgduckdb::DuckDBQueryOrThrow(detach_query);
+		ducklake_attach_config_by_alias.erase(config_it);
+	}
+
+	auto attach_query =
+	    duckdb::StringUtil::Format("ATTACH IF NOT EXISTS '%s' AS %s (%s)", escaped_attach_path.c_str(), attach_as,
+	                               attach_options.c_str());
 
 	elog(DEBUG1, "(DuckLake FDW) Attaching database as '%s': %s", attach_as, attach_query.c_str());
 	pgduckdb::DuckDBQueryOrThrow(attach_query);
+	ducklake_attach_config_by_alias[attach_alias] = attach_config;
 }
 
 void
@@ -178,32 +275,24 @@ RegisterDucklakeForeignTable(Oid foreign_table_oid) {
 	/* Extract data before C++ context to avoid elog(ERROR) with C++ objects on stack */
 	ForeignTable *ft = GetForeignTable(foreign_table_oid);
 	ForeignServer *server = GetForeignServer(ft->serverid);
-
-	const char *metadata_schema = GetOptionValue(server->options, "metadata_schema");
-	const char *dbname = GetOptionValue(server->options, "dbname");
-
-	if (!metadata_schema) {
-		metadata_schema = "ducklake";
-	}
-
-	if (!dbname) {
-		dbname = GetCurrentDatabaseName();
-	}
+	auto config = GetDucklakeFdwServerConfig(server);
 
 	const char *username = GetUserNameFromId(GetUserId(), false);
-	auto attach_as = psprintf("fdw_db_%s", dbname);
-	InvokeCPPFunc(RegisterDucklakeForeignTable_Cpp, dbname, username, metadata_schema, attach_as);
+	auto attach_as = GetDucklakeServerAttachAlias(ft->serverid);
+	InvokeCPPFunc(RegisterDucklakeForeignTable_Cpp, config.dbname, username, config.uri, config.metadata_schema,
+	              attach_as);
 }
 
 static void
 InferAndPopulateForeignTableColumns_Cpp(CreateForeignTableStmt *stmt, const char *schema_name, const char *table_name,
-                                        const char *dbname, const char *username, const char *metadata_schema) {
+                                        const char *dbname, const char *username, const char *uri,
+                                        const char *metadata_schema) {
 	const char *attach_name = FDW_PROBE_ATTACH_NAME;
 	auto probe_query = duckdb::StringUtil::Format("SELECT * FROM %s.%s.%s LIMIT 0", attach_name,
 	                                              quote_identifier(schema_name), quote_identifier(table_name));
 	auto detach_query = duckdb::StringUtil::Format("DETACH DATABASE IF EXISTS %s", attach_name);
 
-	RegisterDucklakeForeignTable_Cpp(dbname, username, metadata_schema, attach_name);
+	RegisterDucklakeForeignTable_Cpp(dbname, username, uri, metadata_schema, attach_name);
 	elog(DEBUG2, "(DuckLake FDW) Probing schema: %s", probe_query.c_str());
 	auto conn = pgduckdb::DuckDBManager::GetConnection();
 	auto prepared = conn->context->Prepare(probe_query);
@@ -219,14 +308,15 @@ InferAndPopulateForeignTableColumns_Cpp(CreateForeignTableStmt *stmt, const char
 		}
 
 		// Provide a helpful error message with context
+		const char *source_name = uri ? uri : dbname;
 		auto error_msg = duckdb::StringUtil::Format(
 		    "Cannot create foreign table: DuckLake table \"%s.%s\" in database \"%s\" is not accessible.\n"
 		    "HINT: Verify that:\n"
 		    "  1. The table exists in the DuckLake catalog\n"
 		    "  2. The schema_name and table_name options are correct\n"
-		    "  3. The metadata_schema option points to the correct schema (default: 'ducklake')\n"
+		    "  3. The metadata_schema option points to the correct schema (default: 'ducklake' in dbname mode)\n"
 		    "  4. You have permission to access the table",
-		    schema_name, table_name, dbname);
+		    schema_name, table_name, source_name);
 
 		throw duckdb::Exception(duckdb::ExceptionType::CATALOG, error_msg);
 	}
@@ -292,11 +382,10 @@ InferAndPopulateForeignTableColumns(CreateForeignTableStmt *stmt) {
 		        (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("schema_name and table_name options are required")));
 	}
 
-	const char *metadata_schema = GetOptionValue(server->options, "metadata_schema", "ducklake");
-	const char *dbname = GetOptionValue(server->options, "dbname", GetCurrentDatabaseName());
+	auto config = GetDucklakeFdwServerConfig(server);
 	const char *username = GetUserNameFromId(GetUserId(), false);
-	InvokeCPPFunc(InferAndPopulateForeignTableColumns_Cpp, stmt, schema_name, table_name, dbname, username,
-	              metadata_schema);
+	InvokeCPPFunc(InferAndPopulateForeignTableColumns_Cpp, stmt, schema_name, table_name, config.dbname, username,
+	              config.uri, config.metadata_schema);
 }
 
 /*
@@ -331,13 +420,12 @@ IsDucklakeForeignTable(Oid relid) {
 char *
 GetDucklakeForeignTableName(Oid foreign_table_oid) {
 	ForeignTable *ft = GetForeignTable(foreign_table_oid);
-	ForeignServer *server = GetForeignServer(ft->serverid);
 
 	const char *schema_name = GetOptionValue(ft->options, "schema_name");
 	const char *table_name = GetOptionValue(ft->options, "table_name");
-	const char *dbname = GetOptionValue(server->options, "dbname", GetCurrentDatabaseName());
+	auto attach_as = GetDucklakeServerAttachAlias(ft->serverid);
 
-	return psprintf("fdw_db_%s.%s.%s", dbname, quote_identifier(schema_name), quote_identifier(table_name));
+	return psprintf("%s.%s.%s", attach_as, quote_identifier(schema_name), quote_identifier(table_name));
 }
 
 void
@@ -577,6 +665,9 @@ ducklake_fdw_validator(PG_FUNCTION_ARGS) {
 	}
 
 	pgduckdb::ValidateRequiredOptions(options_list, catalog);
+	if (catalog == ForeignServerRelationId) {
+		pgduckdb::ValidateServerOptionCombinations(options_list);
+	}
 
 	PG_RETURN_VOID();
 }

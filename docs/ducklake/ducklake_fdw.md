@@ -2,7 +2,9 @@
 
 The DuckLake Foreign Data Wrapper (FDW) provides read-only access to DuckLake tables from PostgreSQL.
 
-**Requirement:** The FDW only supports DuckLake tables that use the same PostgreSQL instance as their catalog service.
+**Modes:**
+- `dbname` mode (default): access DuckLake catalogs that use this PostgreSQL instance as metadata service.
+- `uri` mode: access a DuckLake catalog by URI/path (for example frozen DuckLakes).
 
 ## Quick Start
 
@@ -27,16 +29,32 @@ CREATE SERVER ducklake_server
     FOREIGN DATA WRAPPER ducklake_fdw
     OPTIONS (
         dbname 'my_database',      -- Optional: defaults to current database
-        metadata_schema 'ducklake' -- Optional: defaults to 'ducklake'
+        uri 'ducklake:https://example.com/my.ducklake', -- Optional: DuckLake URI/path
+        metadata_schema 'ducklake' -- Optional: defaults to 'ducklake' in dbname mode
     );
 ```
 
 | Option | Required | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `dbname` | No | Current DB | The PostgreSQL database containing the DuckLake tables |
-| `metadata_schema` | No | `ducklake` | The schema where DuckLake metadata tables reside |
+| `uri` | No | None | DuckLake URI/path to attach (e.g. `ducklake:https://...`) |
+| `metadata_schema` | No | `ducklake` in `dbname` mode | The schema where DuckLake metadata tables reside |
 
-User mapping is unnecessary and not allowed. Since the FDW accesses DuckLake tables on the local PostgreSQL instance, it always uses the current session's credentials to preserve PostgreSQL permission checks.
+`dbname` and `uri` are mutually exclusive. If both are provided, server creation fails.
+
+User mapping is unnecessary and not allowed. In `dbname` mode, the FDW accesses DuckLake tables through the local PostgreSQL instance using the current session's credentials to preserve PostgreSQL permission checks.
+
+## Frozen DuckLakes
+
+Example server definition for a frozen DuckLake catalog:
+
+```sql
+CREATE SERVER frozen_ducklake_server
+    FOREIGN DATA WRAPPER ducklake_fdw
+    OPTIONS (
+        uri 'ducklake:https://my-bucket/path/to/frozen_catalog.ducklake'
+    );
+```
 
 ## Foreign Table Options
 
@@ -102,7 +120,7 @@ ERROR: Cannot create foreign table: DuckLake table "public.my_table" in database
 
 Verify that:
 1. The `schema_name` and `table_name` options are correct
-2. The `metadata_schema` option points to the correct schema (default: `ducklake`)
+2. The `metadata_schema` option points to the correct schema (default: `ducklake` in `dbname` mode)
 3. You have permission to access the table
 
 Check if the table exists:

@@ -36,6 +36,11 @@ CREATE FOREIGN TABLE foreign_test_table ()
 -- Query the foreign table (should return same data)
 SELECT * FROM foreign_test_table ORDER BY id;
 
+-- Foreign table scans must still route through DuckDB when force_execution is disabled
+SET duckdb.force_execution = false;
+SELECT COUNT(*) FROM foreign_test_table;
+SET duckdb.force_execution = true;
+
 -- Test read-only enforcement: INSERT should fail
 INSERT INTO foreign_test_table VALUES (4, 'David', 300.00);
 
@@ -106,6 +111,29 @@ CREATE FOREIGN TABLE foreign_nonexistent ()
     SERVER ducklake_fdw_test
     OPTIONS (schema_name 'public', table_name 'nonexistent_table');
 
+-- Test server option validation: dbname and uri are mutually exclusive
+CREATE SERVER ducklake_fdw_invalid_server
+    FOREIGN DATA WRAPPER ducklake_fdw
+    OPTIONS (dbname 'regression', uri 'ducklake:pgducklake:');
+
+-- Test URI-based catalogs (e.g. frozen DuckLake)
+CREATE SERVER ducklake_uri_server
+    FOREIGN DATA WRAPPER ducklake_fdw
+    OPTIONS (uri 'ducklake:pgducklake:', metadata_schema 'ducklake');
+
+CREATE FOREIGN TABLE foreign_uri_test_table ()
+    SERVER ducklake_uri_server
+    OPTIONS (schema_name 'public', table_name 'managed_test_table');
+
+SELECT * FROM foreign_uri_test_table ORDER BY id;
+
+CREATE FOREIGN TABLE foreign_uri_nonexistent ()
+    SERVER ducklake_uri_server
+    OPTIONS (schema_name 'public', table_name 'nonexistent_table');
+
+DROP FOREIGN TABLE foreign_uri_test_table;
+DROP SERVER ducklake_uri_server;
+
 -- Cleanup same-database tests
 DROP FOREIGN TABLE foreign_test_table;
 DROP SERVER ducklake_fdw_test;
@@ -131,8 +159,39 @@ INSERT INTO archive_data VALUES
 -- Verify data in test database
 SELECT * FROM archive_data ORDER BY product_id;
 
+-- Also create a table with the same name as regression DB for remount tests
+CREATE TABLE managed_test_table (
+    id INT,
+    name TEXT,
+    amount DECIMAL(10,2)
+) USING ducklake;
+
+INSERT INTO managed_test_table VALUES
+    (42, 'Zoe', 999.99);
+
 -- Switch back to main database and access test database via FDW
 \c regression
+
+-- Test remount when server options change in an active session
+CREATE SERVER ducklake_remount_server
+    FOREIGN DATA WRAPPER ducklake_fdw
+    OPTIONS (metadata_schema 'ducklake');
+
+CREATE FOREIGN TABLE foreign_remount_test ()
+    SERVER ducklake_remount_server
+    OPTIONS (schema_name 'public', table_name 'managed_test_table');
+
+SELECT COUNT(*), MIN(name) FROM foreign_remount_test;
+
+ALTER SERVER ducklake_remount_server OPTIONS (ADD dbname 'ducklake_fdw_testdb');
+SELECT COUNT(*), MIN(name) FROM foreign_remount_test;
+
+ALTER SERVER ducklake_remount_server OPTIONS (SET dbname 'regression');
+SELECT COUNT(*), MIN(name) FROM foreign_remount_test;
+
+DROP FOREIGN TABLE foreign_remount_test;
+DROP SERVER ducklake_remount_server;
+
 CREATE SERVER archive_server
     FOREIGN DATA WRAPPER ducklake_fdw
     OPTIONS (dbname 'ducklake_fdw_testdb', metadata_schema 'ducklake');

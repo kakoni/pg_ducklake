@@ -95,8 +95,8 @@ jobs:
             *.cache-from=type=registry,ref=${{ steps.params.outputs.latest_image }}
             *.cache-from=type=gha,scope=${{ github.workflow }}
             *.cache-to=type=gha,mode=max,scope=${{ github.workflow }}
-            postgres.tags=pgducklake/ci-builds:${{ matrix.postgres }}-${{ steps.params.outputs.platform }}-${{ github.sha }}
-            postgres.tags=${{ steps.params.outputs.latest_image }}
+            pg_ducklake_${{ matrix.postgres }}.tags=pgducklake/ci-builds:${{ matrix.postgres }}-${{ steps.params.outputs.platform }}-${{ github.sha }}
+            pg_ducklake_${{ matrix.postgres }}.tags=${{ steps.params.outputs.latest_image }}
 
   docker_merge:
     name: Merge Docker image for Postgres ${{ matrix.postgres }}

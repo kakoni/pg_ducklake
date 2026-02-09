@@ -44,6 +44,18 @@ SELECT * FROM foreign_test_table ORDER BY id;
   3 | Charlie | 150.25
 (3 rows)
 
+-- Foreign table scans must still route through DuckDB when force_execution is disabled
+SET duckdb.force_execution = false;
+SET
+SELECT COUNT(*) FROM foreign_test_table;
+ count 
+-------
+     3
+(1 row)
+
+SET duckdb.force_execution = true;
+SET
+
 -- Test read-only enforcement: INSERT should fail
 INSERT INTO foreign_test_table VALUES (4, 'David', 300.00);
 ERROR:  cannot insert into foreign table "foreign_test_table"
@@ -141,8 +153,39 @@ ERROR:  (PGDuckDB/InferAndPopulateForeignTableColumns_Cpp) Catalog Error: Cannot
 HINT: Verify that:
   1. The table exists in the DuckLake catalog
   2. The schema_name and table_name options are correct
-  3. The metadata_schema option points to the correct schema (default: 'ducklake')
+  3. The metadata_schema option points to the correct schema (default: 'ducklake' in dbname mode)
   4. You have permission to access the table
+-- Test server option validation: dbname and uri are mutually exclusive
+CREATE SERVER ducklake_fdw_invalid_server
+    FOREIGN DATA WRAPPER ducklake_fdw
+    OPTIONS (dbname 'regression', uri 'ducklake:pgducklake:');
+ERROR:  options "dbname" and "uri" are mutually exclusive
+-- Test URI-based catalogs (e.g. frozen DuckLake)
+CREATE SERVER ducklake_uri_server
+    FOREIGN DATA WRAPPER ducklake_fdw
+    OPTIONS (uri 'ducklake:pgducklake:', metadata_schema 'ducklake');
+CREATE FOREIGN TABLE foreign_uri_test_table ()
+    SERVER ducklake_uri_server
+    OPTIONS (schema_name 'public', table_name 'managed_test_table');
+SELECT * FROM foreign_uri_test_table ORDER BY id;
+ id |  name   | amount 
+----+---------+--------
+  1 | Alice   | 100.50
+  2 | Bob     | 200.75
+  3 | Charlie | 150.25
+(3 rows)
+
+CREATE FOREIGN TABLE foreign_uri_nonexistent ()
+    SERVER ducklake_uri_server
+    OPTIONS (schema_name 'public', table_name 'nonexistent_table');
+ERROR:  (PGDuckDB/InferAndPopulateForeignTableColumns_Cpp) Catalog Error: Cannot create foreign table: DuckLake table "public.nonexistent_table" in database "ducklake:pgducklake:" is not accessible.
+HINT: Verify that:
+  1. The table exists in the DuckLake catalog
+  2. The schema_name and table_name options are correct
+  3. The metadata_schema option points to the correct schema (default: 'ducklake' in dbname mode)
+  4. You have permission to access the table
+DROP FOREIGN TABLE foreign_uri_test_table;
+DROP SERVER ducklake_uri_server;
 -- Cleanup same-database tests
 DROP FOREIGN TABLE foreign_test_table;
 DROP SERVER ducklake_fdw_test;
@@ -170,8 +213,46 @@ SELECT * FROM archive_data ORDER BY product_id;
           3 | Doohickey    | 14.99
 (3 rows)
 
+-- Also create a table with the same name as regression DB for remount tests
+CREATE TABLE managed_test_table (
+    id INT,
+    name TEXT,
+    amount DECIMAL(10,2)
+) USING ducklake;
+INSERT INTO managed_test_table VALUES
+    (42, 'Zoe', 999.99);
+
 -- Switch back to main database and access test database via FDW
 \c regression
+-- Test remount when server options change in an active session
+CREATE SERVER ducklake_remount_server
+    FOREIGN DATA WRAPPER ducklake_fdw
+    OPTIONS (metadata_schema 'ducklake');
+CREATE FOREIGN TABLE foreign_remount_test ()
+    SERVER ducklake_remount_server
+    OPTIONS (schema_name 'public', table_name 'managed_test_table');
+SELECT COUNT(*), MIN(name) FROM foreign_remount_test;
+ count |  min  
+-------+-------
+     3 | Alice
+(1 row)
+
+ALTER SERVER ducklake_remount_server OPTIONS (ADD dbname 'ducklake_fdw_testdb');
+SELECT COUNT(*), MIN(name) FROM foreign_remount_test;
+ count | min 
+-------+-----
+     1 | Zoe
+(1 row)
+
+ALTER SERVER ducklake_remount_server OPTIONS (SET dbname 'regression');
+SELECT COUNT(*), MIN(name) FROM foreign_remount_test;
+ count |  min  
+-------+-------
+     3 | Alice
+(1 row)
+
+DROP FOREIGN TABLE foreign_remount_test;
+DROP SERVER ducklake_remount_server;
 CREATE SERVER archive_server
     FOREIGN DATA WRAPPER ducklake_fdw
     OPTIONS (dbname 'ducklake_fdw_testdb', metadata_schema 'ducklake');

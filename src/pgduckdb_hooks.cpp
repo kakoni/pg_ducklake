@@ -34,6 +34,7 @@ extern "C" {
 #include "pgduckdb/vendor/pg_explain.hpp"
 #include "pgduckdb/vendor/pg_list.hpp"
 #include "pgduckdb/pgduckdb_node.hpp"
+#include "pgduckdb/ducklake/pgducklake_fdw.hpp"
 #include "pgduckdb/utility/cpp_wrapper.hpp"
 
 static planner_hook_type prev_planner_hook = NULL;
@@ -70,9 +71,19 @@ IsDuckdbTable(Oid relid) {
 }
 
 static bool
-ContainsDuckdbTables(List *rte_list) {
+ContainsDuckdbTables(List *rte_list, CmdType command_type) {
 	foreach_node(RangeTblEntry, rte, rte_list) {
 		if (IsDuckdbTable(rte->relid)) {
+			return true;
+		}
+
+		/*
+		 * DuckLake FDW tables must be routed through DuckDB for SELECT queries.
+		 * For write statements keep PostgreSQL behavior so unsupported writes
+		 * fail with the regular foreign table errors.
+		 */
+		if (command_type == CMD_SELECT && rte->relid != InvalidOid && rte->rtekind == RTE_RELATION &&
+		    pgduckdb::IsDucklakeForeignTable(rte->relid)) {
 			return true;
 		}
 	}
@@ -86,7 +97,7 @@ ContainsDuckdbItems(Node *node, void *context) {
 
 	if (IsA(node, Query)) {
 		Query *query = (Query *)node;
-		if (ContainsDuckdbTables(query->rtable)) {
+		if (ContainsDuckdbTables(query->rtable, query->commandType)) {
 			return true;
 		}
 #if PG_VERSION_NUM >= 160000
